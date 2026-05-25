@@ -314,6 +314,13 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 
 插件会进入 `solveBotChallenge` 自动求解后再重试原请求。
 
+当前同时兼容两类验证结构：
+
+- 新版 PoW：`const json={id,N,x,t};const jss=...`，插件用 Go 的 `math/big` 直接计算 `y = y*y % N` 共 `t` 次，然后提交 `action=verify&id={id}&y={y}`。
+- 旧版哈希枚举：`const json={id,challenge,diff,salt};const jss=...`，插件枚举 `nonce`，匹配 `sha256(strconv.Itoa(nonce)+salt)` 后提交 `nonce[]`。
+
+新版 PoW 不依赖 Playwright、Puppeteer、Selenium 或真实浏览器环境；它是对站点 worker 脚本的轻量算法复现。为贴近前端行为，计算完成不足 3 秒时会补齐等待后再提交验证。
+
 验证通过后，站点通常会下发 `browser_verified` 这类验证态 Cookie。当前插件会：
 
 - 在登录阶段导出并保存当前 Cookie 快照
@@ -321,6 +328,52 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 - 在插件重启后优先使用已保存 Cookie 恢复会话，而不是默认先重登
 
 这一步的目的是尽量复用浏览器验证结果，减少重复触发 challenge。
+
+#### 1.1 2026-05 登录验证循环问题
+
+曾出现过一种登录失败场景：日志里先显示 `Challenge验证成功`，但随后重试原请求仍然返回 `浏览器安全验证`，最终报错 `重试后仍然进入机器人验证页`。
+
+排查结论：新版验证态不只依赖 `browser_verified` Cookie，还会受同一次客户端请求指纹影响。此前 `requestWithChallengeRetry` 里 GET 请求直接使用 cloudscraper 内部的 `http.Client.Do`，而验证提交使用 `scraper.Post`；这会让“访问验证页 / 提交验证 / 重试原请求”没有完整经过 cloudscraper 的同一套浏览器化请求处理，导致站点认为重试请求仍然需要验证。
+
+当前修复：
+
+- GET 请求统一使用 `scraper.Get`
+- POST 请求继续使用 `scraper.Post`
+- challenge 页、验证提交、重试原请求都保持在同一个 cloudscraper 会话与请求链路里
+- 调试日志中的登录 POST 数据已对密码脱敏，只输出密码长度
+
+验证方式：
+
+1. 使用错误密码登录，应能通过 challenge 并返回站点的账号密码错误 JSON，而不是停在机器人验证页。
+2. 使用正确密码登录，应返回 `登录成功`，并在 Cookie 快照中包含 `PHPSESSID`、`app_auth`、`browser_verified`。
+3. 调用 `test_search` 搜索关键词，应能访问搜索页和详情接口并返回网盘链接。
+
+#### 1.2 2026-05 新版 PoW 参数变更
+
+新版验证页不再只返回 `challenge/diff/salt`，而是返回类似：
+
+```javascript
+const json={"id":"...","N":"...","x":"...","t":800000};const jss={...};
+```
+
+对应的 worker 逻辑等价于：
+
+```text
+N = BigInt("0x" + json.N)
+y = BigInt("0x" + json.x)
+repeat json.t times:
+    y = (y * y) % N
+```
+
+验证提交表单为：
+
+```text
+action=verify&id={id}&y={hex(y)}
+```
+
+此前代码只识别旧版 `challenge/diff/salt`，会在登录或搜索进入新版验证页时报 `验证数据无效`。当前实现已在 `solveBotChallenge` 中自动分流新版 PoW 和旧版哈希枚举。
+
+因为新版验证会增加登录耗时，配套前端 `pansou-web` 也把 Gying 登录 / 测试搜索请求超时放宽，并在登录请求超时后回查一次状态，避免后端已登录成功但前端误报“登录失败”。
 
 ### 2. 搜索链路不是单接口
 
